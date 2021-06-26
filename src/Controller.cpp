@@ -29,7 +29,9 @@
 #include "TXO.h"
 #include "ZmqSubNotifier.h"
 
+
 #include "bitcoin/amount.h"
+#include "bitcoin/block.h"
 #include "bitcoin/crypto/common.h"  // ReadLE32
 #include "bitcoin/rpc/protocol.h" // for RPC_INVALID_ADDRESS_OR_KEY
 #include "bitcoin/transaction.h"
@@ -503,7 +505,9 @@ void DownloadBlocksTask::process()
 
 void DownloadBlocksTask::do_get(unsigned int bnum)
 {
-    if (ctl->isStopping())  return; // short-circuit early return if controller is stopping
+    if (ctl->isStopping()) {
+        return;
+    } // short-circuit early return if controller is stopping
     if (unsigned msec = ctl->downloadTaskRecommendedThrottleTimeMsec(bnum); msec > 0) {
         // Controller told us to back off because it is backlogged.
         // Schedule ourselves to run again soon and return.
@@ -515,90 +519,91 @@ void DownloadBlocksTask::do_get(unsigned int bnum)
     submitRequest("getblockhash", {bnum}, [this, bnum](const RPC::Message & resp){
         QVariant var = resp.result();
         const auto hash = Util::ParseHexFast(var.toByteArray());
-        if (hash.length() == HashLen) {
-            submitRequest("getblock", {var, false}, [this, bnum, hash](const RPC::Message & resp){
-                try {
-                    auto rawblock = Util::ParseHexFast(resp.result().toByteArray());
-                    const auto header = rawblock.left(HEADER_SIZE); // we need a deep copy of this anyway so might as well take it now.
-                    QByteArray chkHash;
-                    if (bool sizeOk = header.length() == HEADER_SIZE; sizeOk && (chkHash = BTC::HashRev(header)) == hash) {
-                        PreProcessedBlockPtr ppb;
-                        try {
-                            ppb = PreProcessedBlock::makeShared(bnum, size_t(rawblock.size()),
-                                                                BTC::Deserialize<bitcoin::CBlock>(rawblock, 0, allowSegWit));
-                        } catch (const std::ios_base::failure &e) {
-                            // deserialization error -- check if block is segwit and we are not segwit
-                            if (!allowSegWit) {
-                                try {
-                                    const auto cblock = BTC::DeserializeSegWit<bitcoin::CBlock>(rawblock);
-                                    // If we get here the block deserialized ok as segwit but not ok as non-segwit.
-                                    // We must assume that there is some misconfiguration e.g. the remote is BTC
-                                    // but DB is not expecting BTC. This can happen if user is using non-Satoshi
-                                    // bitcoind with BTC.  We only support /Satoshi... as uagent for BTC due to the
-                                    // way that our auto-detection works.
-                                    if (std::any_of(cblock.vtx.begin(), cblock.vtx.end(),
-                                                    [](const auto &tx){ return tx->HasWitness(); }))
-                                        throw InternalError("SegWit block encountered for non-SegWit coin."
-                                                            " If you wish to use BTC, please delete the datadir and"
-                                                            " resynch using Bitcoin Core v0.17.0 or later.");
-                                } catch (const std::ios_base::failure &) { /* ignore -- block is bad as segwit too. */}
-                            }
-                            throw; // outer catch clause will handle printing the message
-                        }
-                        assert(bool(ppb));
-
-                        if (TRACE) Trace() << "block " << bnum << " size: " << rawblock.size() << " nTx: " << ppb->txInfos.size();
-
-                        rawblock.clear(); // free memory right away (needed for ScaleNet huge blocks)
-
-                        // . <--- NOTE: rawblock not to be used beyond this point (it is now empty)
-
-                        // update some stats for /stats endpoint
-                        nTx += ppb->txInfos.size();
-                        nOuts += ppb->outputs.size();
-                        nIns += ppb->inputs.size();
-
-                        const size_t index = height2Index(bnum);
-                        ++goodCt;
-                        q_ct = qMax(q_ct-1, 0);
-                        lastProgress = double(index) / double(expectedCt);
-                        if (!(bnum % 1000) && bnum) {
-                            emit progress(lastProgress);
-                        }
-                        if (TRACE) Trace() << resp.method << ": header for height: " << bnum << " len: " << header.length();
-                        emit ctl->putBlock(this, ppb); // send the block off to the Controller thread for further processing and for save to db
-                        if (goodCt >= expectedCt) {
-                            // flag state to maybeDone to do checks when process() called again
-                            maybeDone = true;
-                            AGAIN();
-                            return;
-                        }
-                        while (goodCt + unsigned(q_ct) < expectedCt && q_ct < max_q) {
-                            // queue multiple at once
-                            AGAIN();
-                            ++q_ct;
-                        }
-                    } else if (!sizeOk) {
-                        Warning() << resp.method << ": at height " << bnum << " header not valid (decoded size: " << header.length() << ")";
-                        errorCode = int(bnum);
-                        errorMessage = QString("bad size for height %1").arg(bnum);
-                        emit errored();
-                    } else {
-                        Warning() << resp.method << ": at height " << bnum << " header not valid (expected hash: " << hash.toHex() << ", got hash: " << chkHash.toHex() << ")";
-                        errorCode = int(bnum);
-                        errorMessage = QString("hash mismatch for height %1").arg(bnum);
-                        emit errored();
-                    }
-                } catch (const std::exception &e) {
-                    Fatal() << QString("Caught exception processing block %1: %2").arg(bnum).arg(e.what());
-                }
-            });
-        } else {
+        if (hash.length() != HashLen) {
             Warning() << resp.method << ": at height " << bnum << " hash not valid (decoded size: " << hash.length() << ")";
             errorCode = int(bnum);
             errorMessage = QString("invalid hash for height %1").arg(bnum);
             emit errored();
         }
+        submitRequest("getblock", {var, false}, [this, bnum, hash](const RPC::Message & resp){
+            try {
+                auto rawblock = Util::ParseHexFast(resp.result().toByteArray());
+                bool sizeOk = rawblock.length() >= HEADER_SIZE;
+                if(!sizeOk) {
+                    Warning() << resp.method << ": at height " << bnum << " block length smaller than required header size of "<< HEADER_SIZE <<  " (decoded size: " << rawblock.length() << ")";
+                    errorCode = int(bnum);
+                    errorMessage = QString("bad size for height %1").arg(bnum);
+                    emit errored();
+                }
+                const auto block = BTC::Deserialize<bitcoin::CBlock>(rawblock, 0, allowSegWit);
+                const auto header = block.GetBlockHeader();
+                QByteArray chkHash = BTC::Hash2ByteArrayRev(header.GetHash());
+                if(chkHash != hash) {
+                    Warning() << resp.method << ": at height " << bnum << " header not valid (expected hash: " << chkHash.toHex() << ", got hash: " << chkHash.toHex() << ")";
+                    errorCode = int(bnum);
+                    errorMessage = QString("hash mismatch for height %1").arg(bnum);
+                    emit errored();
+                }
+
+                PreProcessedBlockPtr ppb;
+                try {
+                    ppb = PreProcessedBlock::makeShared(bnum, size_t(rawblock.size()), block);
+                } catch (const std::ios_base::failure &e) {
+                    // deserialization error -- check if block is segwit and we are not segwit
+                    if (!allowSegWit) {
+                        try {
+                            const auto cblock = BTC::DeserializeSegWit<bitcoin::CBlock>(rawblock);
+                            // If we get here the block deserialized ok as segwit but not ok as non-segwit.
+                            // We must assume that there is some misconfiguration e.g. the remote is BTC
+                            // but DB is not expecting BTC. This can happen if user is using non-Satoshi
+                            // bitcoind with BTC.  We only support /Satoshi... as uagent for BTC due to the
+                            // way that our auto-detection works.
+                            if (std::any_of(cblock.vtx.begin(), cblock.vtx.end(),
+                                            [](const auto &tx){ return tx->HasWitness(); }))
+                                throw InternalError("SegWit block encountered for non-SegWit coin."
+                                                            " If you wish to use BTC, please delete the datadir and"
+                                                            " resynch using Bitcoin Core v0.17.0 or later.");
+                        } catch (const std::ios_base::failure &) { /* ignore -- block is bad as segwit too. */}
+                    }
+                    throw; // outer catch clause will handle printing the message
+                }
+                assert(bool(ppb));
+
+                if (TRACE) Trace() << "block " << bnum << " size: " << rawblock.size() << " nTx: " << ppb->txInfos.size();
+
+                rawblock.clear(); // free memory right away (needed for ScaleNet huge blocks)
+
+                // . <--- NOTE: rawblock not to be used beyond this point (it is now empty)
+
+                // update some stats for /stats endpoint
+                nTx += ppb->txInfos.size();
+                nOuts += ppb->outputs.size();
+                nIns += ppb->inputs.size();
+
+                const size_t index = height2Index(bnum);
+                ++goodCt;
+                q_ct = qMax(q_ct-1, 0);
+                lastProgress = double(index) / double(expectedCt);
+                if (!(bnum % 1000) && bnum) {
+                    emit progress(lastProgress);
+                }
+                if (TRACE) Trace() << resp.method << ": header for height: " << bnum << " len: " << chkHash.toHex();
+                emit ctl->putBlock(this, ppb); // send the block off to the Controller thread for further processing and for save to db
+                if (goodCt >= expectedCt) {
+                    // flag state to maybeDone to do checks when process() called again
+                    maybeDone = true;
+                    AGAIN();
+                    return;
+                }
+                while (goodCt + unsigned(q_ct) < expectedCt && q_ct < max_q) {
+                    // queue multiple at once
+                    AGAIN();
+                    ++q_ct;
+                }
+            } catch (const std::exception &e) {
+                Fatal() << QString("Caught exception processing block %1: %2").arg(bnum).arg(e.what());
+            }
+        });
     });
 }
 
@@ -864,9 +869,9 @@ void SynchMempoolTask::doDLNextTx()
         it = txsNeedingDownload.erase(it); // pop it off the front
     }
     assert(bool(tx));
-    const auto hashHex = Util::ToHexFast(tx->hash);
-    txsWaitingForResponse[tx->hash] = tx;
-    submitRequest("getrawtransaction", {hashHex, false}, [this, hashHex, tx](const RPC::Message & resp){
+    const auto txIdHex = Util::ToHexFast(tx->txid);
+    txsWaitingForResponse[tx->txid] = tx;
+    submitRequest("getrawtransaction", {txIdHex, false}, [this, txIdHex, tx](const RPC::Message & resp){
         QByteArray txdata = resp.result().toByteArray();
         const int expectedLen = txdata.length() / 2;
         txdata = Util::ParseHexFast(txdata);
@@ -881,7 +886,7 @@ void SynchMempoolTask::doDLNextTx()
         try {
             ctx = BTC::Deserialize<bitcoin::CMutableTransaction>(txdata, 0, isBTC);
         } catch (const std::exception &e) {
-            Error() << "Error deserializing tx: " << tx->hash.toHex() << ", exception: " << e.what();
+            Error() << "Error deserializing tx: " << tx->txid.toHex() << ", exception: " << e.what();
             emit errored();
             return;
         }
@@ -891,10 +896,10 @@ void SynchMempoolTask::doDLNextTx()
         tx->sizeBytes = unsigned(expectedLen);
 
         if (TRACE)
-            Debug() << "got reply for tx: " << hashHex << " " << txdata.length() << " bytes";
+            Debug() << "got reply for tx: " << txIdHex << " " << txdata.length() << " bytes";
 
         // ctx is moved into CTransactionRef below via move construction
-        const auto & [_, txref] = txsDownloaded[tx->hash] = {tx, bitcoin::MakeTransactionRef(std::move(ctx)) };
+        const auto & [_, txref] = txsDownloaded[tx->txid] = {tx, bitcoin::MakeTransactionRef(std::move(ctx)) };
 
         // Check txdata is sane -- its hash should match the hash we asked for.
         //
@@ -902,20 +907,21 @@ void SynchMempoolTask::doDLNextTx()
         // the CTransaction necessarily causes it to compute its own (segwit-stripped) hash on construction, so we get
         // that hash "for free" here as it were -- and we can use it to ensure sanity that the tx matches what we
         // expected without the need to do BTC::HashRev(txdata) above (which would be redundant).
-        if (Util::reversedCopy(txref->GetHashRef()) != tx->hash) {
-            txsDownloaded.erase(tx->hash); // remove the object we just inserted
+        if (Util::reversedCopy(txref->GetIdRef()) != tx->txid) {
+            txsDownloaded.erase(tx->txid); // remove the object we just inserted
             // WARNING! `txref` is now a dangling reference at this point!
-            Error() << "Received tx data appears to not match requested tx for txhash: " << tx->hash.toHex() << "! FIXME!!";
+            Error() << "Received tx data appears to not match requested tx for txhash: " << tx->txid.toHex() << "! FIXME!!";
             emit errored();
             return;
         }
 
-        txidsAffected.insert(tx->hash);
-        txsWaitingForResponse.erase(tx->hash);
+
+        txidsAffected.insert(tx->txid);
+        txsWaitingForResponse.erase(tx->txid);
         updateLastProgress();
         AGAIN();
     },
-    [this, hashHex, tx](const RPC::Message &resp) {
+    [this, txIdHex, tx](const RPC::Message &resp) {
         if (resp.errorCode() != bitcoin::RPCErrorCode::RPC_INVALID_ADDRESS_OR_KEY) {
             // Probably an unknown bitcoind implementation (not: BCHN, BU, or Core); warn here so I get bug reports
             // about this, hopefully, and we can handle it properly in future versions.
@@ -926,10 +932,10 @@ void SynchMempoolTask::doDLNextTx()
         // Since bitcoind doesn't have the tx -- then it and its children will also fail, which is fine. It's as if
         // it never existed and as if we never got it in the original list from `getrawmempool`!
         const auto *const pre = isBTC ? "Tx dropped out of mempool (possibly due to RBF)" : "Tx dropped out of mempool";
-        Warning() << pre << ": " << QString(hashHex) << " (error response: " << resp.errorMessage()
+        Warning() << pre << ": " << QString(txIdHex) << " (error response: " << resp.errorMessage()
                   << "), ignoring mempool tx ...";
-        txsFailedDownload.insert(tx->hash);
-        txsWaitingForResponse.erase(tx->hash);
+        txsFailedDownload.insert(tx->txid);
+        txsWaitingForResponse.erase(tx->txid);
         if (txsDownloaded.empty() && txsFailedDownload.size() > kFailedDownloadMax) {
             // Too many failures without any successes. Likely some RPC API issue with bitcoind or a new block arrived
             // full of double-spends for previous mempool view (unlikely but possible).  Something is very wrong.
@@ -972,7 +978,7 @@ void SynchMempoolTask::doGetRawMempool()
                 ++newCt;
                 Mempool::TxRef tx = std::make_shared<Mempool::Tx>();
                 tx->hashXs.max_load_factor(.9); // hopefully this will save some memory by expicitly setting max table size to 90%
-                tx->hash = hash;
+                tx->txid = hash;
                 // Note: we end up calculating the fee ourselves since I don't trust doubles here. I wish bitcoind would have returned sats.. :(
                 txsNeedingDownload[hash] = tx;
             }

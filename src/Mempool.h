@@ -45,7 +45,7 @@ struct Mempool
     /// This info, with the exception of `hashXs` comes from bitcoind via the "getrawmempool false" RPC call.
     struct Tx
     {
-        TxHash hash; ///< in reverse bitcoind order (ready for hex encode), fixed value.
+        TxHash txid; ///< in reverse bitcoind order (ready for hex encode), fixed value.
 
         bitcoin::Amount fee{bitcoin::Amount::zero()}; ///< we calculate this fee ourselves since in the past I noticed we get a funny value sometimes that's off by 1 or 2 sats --  which I suspect is due limitations of doubles, perhaps?
         unsigned sizeBytes = 0;
@@ -91,12 +91,12 @@ struct Mempool
             const uint8_t nParentMe    =   hasUnconfirmedParentTx ? 1 : 0,
                           nParentOther = o.hasUnconfirmedParentTx ? 1 : 0;
             // always sort the unconf. parent tx's *after* the regular (confirmed parent-only) tx's.
-            return std::tie(nParentMe, hash) < std::tie(nParentOther, o.hash);
+            return std::tie(nParentMe, txid) < std::tie(nParentOther, o.txid);
         }
 
         bool operator==(const Tx &o) const noexcept {
-            return     std::tie(  hash,   sizeBytes,   fee,   hasUnconfirmedParentTx,   txos,   hashXs)
-                    == std::tie(o.hash, o.sizeBytes, o.fee, o.hasUnconfirmedParentTx, o.txos, o.hashXs);
+            return     std::tie(  txid,   sizeBytes,   fee,   hasUnconfirmedParentTx,   txos,   hashXs)
+                    == std::tie(o.txid, o.sizeBytes, o.fee, o.hasUnconfirmedParentTx, o.txos, o.hashXs);
         }
         bool operator!=(const Tx &o) const noexcept { return !(*this == o); }
 

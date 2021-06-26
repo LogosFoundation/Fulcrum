@@ -526,13 +526,13 @@ namespace {
             const Tic t0;
             rocksdb::WriteBatch batch;
             for (TxNum i = 0; i < txInfos.size(); ++i) {
-                const ByteView key = makeKeyFromHash(txInfos[i].hash);
+                const ByteView key = makeKeyFromHash(txInfos[i].id);
                 const VarInt val(blockTxNum0 + i);
                 // save by appending VarInt. Note that this uses the 'ConcatOperator' class we defined in this file,
                 // which requires rocksdb be compiled with RTTI.
                 if (auto st = batch.Merge(ToSlice(key), ToSlice(val.byteView())); !st.ok())
                     throw DatabaseError(QString("%1: batch merge fail for txHash %2: %3")
-                                        .arg(dbName(), QString(txInfos[i].hash.toHex()), QString::fromStdString(st.ToString())));
+                                        .arg(dbName(), QString(txInfos[i].id.toHex()), QString::fromStdString(st.ToString())));
             }
             if (auto st = db->Write(wrOpts, &batch) ; !st.ok())
                 throw DatabaseError(QString("%1: batch merge fail: %2").arg(dbName(), QString::fromStdString(st.ToString())));
@@ -894,7 +894,7 @@ namespace {
                 // fake it
                 fakeInfos.resize(recs.size());
                 for (size_t j = 0; j < recs.size(); ++j)
-                    fakeInfos[j].hash = recs[j];
+                    fakeInfos[j].id = recs[j];
                 insertForBlock(i, fakeInfos); // this throws on error
                 i += fakeInfos.size();
             }
@@ -1479,17 +1479,15 @@ void Storage::setCoin(const QString &coin) {
 TxNum Storage::getTxNum() const { return p->txNumNext.load(); }
 
 auto Storage::latestTip(Header *hdrOut) const -> std::pair<int, HeaderHash> {
-    std::pair<int, HeaderHash> ret = headerVerifier().first.lastHeaderProcessed(); // ok; lock stays locked until statement end.
-    if (hdrOut) *hdrOut = ret.second; // this is not a hash but the actual block header
-    if (ret.second.isEmpty() || ret.first < 0) {
-        ret.first = -1;
-        ret.second.clear();
-        if (hdrOut) hdrOut->clear();
-    } else {
-        // .ret now has the actual header but we want the hash
-        ret.second = BTC::HashRev(ret.second);
+    std::pair<int, bitcoin::CBlockHeader> ret = headerVerifier().first.lastHeaderProcessed(); // ok; lock stays locked until statement end.
+    if (hdrOut) {
+        hdrOut->clear();
     }
-    return ret;
+    if (ret.second.IsNull() || ret.first < 0) {
+        return std::pair(-1, HeaderHash());
+    }
+    *hdrOut = BTC::Serialize(ret.second);
+    return std::pair(ret.first, BTC::Hash2ByteArrayRev(ret.second.GetHash()));
 }
 
 auto Storage::latestHeight() const -> std::optional<BlockHeight>
@@ -2162,7 +2160,7 @@ std::optional<TXOInfo> Storage::utxoGet(const TXO &txo)
                         // should never happen
                         throw InternalError(QString("scripthash %1 has inconsistent mempool state for tx %2! FIXME!")
                                             .arg(QString(hxTxIt->first.toHex()))
-                                            .arg(QString(tx->hash.toHex())));
+                                            .arg(QString(tx->txid.toHex())));
                     }
                 }
             }
@@ -2206,9 +2204,9 @@ void Storage::addBlock(PreProcessedBlockPtr ppb, bool saveUndo, unsigned nReserv
             Mempool::TxHashNumMap txidMap(/* bucket_count: */ rsvsz);
             notify->txidsAffected.reserve(rsvsz);
             for (std::size_t i = 1 /* skip coinbase */; i < sz; ++i) {
-                const auto & txHash = ppb->txInfos[i].hash;
-                txidMap.emplace(txHash, blockTxNum0 + i);
-                notify->txidsAffected.insert(txHash); // add to notify set for txSubsMgr
+                const auto & txId = ppb->txInfos[i].id;
+                txidMap.emplace(txId, blockTxNum0 + i);
+                notify->txidsAffected.insert(txId); // add to notify set for txSubsMgr
             }
             Mempool::ScriptHashesAffectedSet affected;
             // Pre-reserve some capacity for the tmp affected set to avoid much rehashing.
@@ -2246,7 +2244,8 @@ void Storage::addBlock(PreProcessedBlockPtr ppb, bool saveUndo, unsigned nReserv
                 }
                 // save raw header back to our buffer -- this will be used at the end of this function to add it to the db
                 // after everything completes successfully.
-                rawHeader = p->headerVerifier.lastHeaderProcessed().second;
+
+                rawHeader = BTC::Serialize(p->headerVerifier.lastHeaderProcessed().second);
             }
 
             setDirty(true); // <--  no turning back. if the app crashes unexpectedly while this is set, on next restart it will refuse to run and insist on a clean resynch.
@@ -2255,7 +2254,7 @@ void Storage::addBlock(PreProcessedBlockPtr ppb, bool saveUndo, unsigned nReserv
                 auto batch = p->txNumsFile->beginBatchAppend(); // may throw if io error in c'tor here.
                 QString errStr;
                 for (const auto & txInfo : ppb->txInfos) {
-                    if (!batch.append(txInfo.hash, &errStr)) // does not throw here, but we do.
+                    if (!batch.append(txInfo.id, &errStr)) // does not throw here, but we do.
                         throw InternalError(QString("Batch append for txNums failed: %1.").arg(errStr));
                 }
                 // <-- The batch d'tor may close the app on error here with Fatal() if a low-level file error occurs now
@@ -2304,16 +2303,16 @@ void Storage::addBlock(PreProcessedBlockPtr ppb, bool saveUndo, unsigned nReserv
                             const auto & out = ppb->outputs[oidx];
                             if (out.spentInInputIndex.has_value()) {
                                 if constexpr (debugPrt)
-                                    Debug() << "Skipping output #: " << oidx << " for " << ppb->txInfos[out.txIdx].hash.toHex() << " (was spent in same block tx: " << ppb->txInfos[ppb->inputs[*out.spentInInputIndex].txIdx].hash.toHex() << ")";
+                                    Debug() << "Skipping output #: " << oidx << " for " << ppb->txInfos[out.txIdx].id.toHex() << " (was spent in same block tx: " << ppb->txInfos[ppb->inputs[*out.spentInInputIndex].txIdx].id.toHex() << ")";
                                 continue;
                             }
-                            const TxHash & hash = ppb->txInfos[out.txIdx].hash;
+                            const TxId & txid = ppb->txInfos[out.txIdx].id;
                             TXOInfo info;
                             info.hashX = hashX;
                             info.amount = out.amount;
                             info.confirmedHeight = ppb->height;
                             info.txNum = blockTxNum0 + out.txIdx;
-                            const TXO txo{ hash, out.outN };
+                            const TXO txo{ txid, out.outN };
                             const CompactTXO ctxo(info.txNum, txo.outN);
                             utxoBatch.add(txo, info, ctxo); // add to db
                             if (undo) { // save undo info if we are in saveUndo mode
@@ -2321,7 +2320,7 @@ void Storage::addBlock(PreProcessedBlockPtr ppb, bool saveUndo, unsigned nReserv
                             }
                             if constexpr (debugPrt)
                                 Debug() << "Added txo: " << txo.toString()
-                                        << " (txid: " << hash.toHex() << " height: " << ppb->height << ") "
+                                        << " (txid: " << txid.toHex() << " height: " << ppb->height << ") "
                                         << " amount: " << info.amount.ToString() << " for HashX: " << info.hashX.toHex();
                         }
                     }
@@ -2329,7 +2328,7 @@ void Storage::addBlock(PreProcessedBlockPtr ppb, bool saveUndo, unsigned nReserv
                     // add spends (process inputs)
                     unsigned inum = 0;
                     for (auto & in : ppb->inputs) {
-                        const TXO txo{in.prevoutHash, in.prevoutN};
+                        const TXO txo{in.prevoutTxId, in.prevoutN};
                         if (!inum) {
                             // coinbase.. skip
                         } else if (in.parentTxOutIdx.has_value()) {
@@ -2350,7 +2349,7 @@ void Storage::addBlock(PreProcessedBlockPtr ppb, bool saveUndo, unsigned nReserv
 
                             }
                             if constexpr (debugPrt) {
-                                const auto dbgTxIdHex = ppb->txHashForInputIdx(inum).toHex();
+                                const auto dbgTxIdHex = ppb->txIdForInputIdx(inum).toHex();
                                 Debug() << "Spent " << txo.toString() << " amount: " << info.amount.ToString()
                                         << " in txid: "  << dbgTxIdHex << " height: " << ppb->height
                                         << " input number: " << ppb->numForInputIdx(inum).value_or(0xffff)
@@ -2364,9 +2363,9 @@ void Storage::addBlock(PreProcessedBlockPtr ppb, bool saveUndo, unsigned nReserv
                         } else {
                             QString s;
                             {
-                                const auto dbgTxIdHex = ppb->txHashForInputIdx(inum).toHex();
+                                const auto dbgTxIdHex = ppb->txIdForInputIdx(inum).toHex();
                                 QTextStream ts(&s);
-                                ts << "Failed to spend: " << in.prevoutHash.toHex() << ":" << in.prevoutN << " (spending txid: " << dbgTxIdHex << ")";
+                                ts << "Failed to spend: " << in.prevoutTxId.toHex() << ":" << in.prevoutN << " (spending txid: " << dbgTxIdHex << ")";
                             }
                             throw InternalError(s);
                         }
@@ -2562,7 +2561,7 @@ BlockHeight Storage::undoLatestBlock(bool notifySubs)
         p->mempool.clear(); // make sure mempool is clean (see note above as to why)
 
         const auto [tip, header] = p->headerVerifier.lastHeaderProcessed();
-        if (tip <= 0 || header.length() != p->blockHeaderSize()) throw UndoInfoMissing("No header to undo");
+        if (tip <= 0) throw UndoInfoMissing("No header to undo");
         prevHeight = unsigned(tip-1);
         Header prevHeader;
         {
@@ -2579,7 +2578,7 @@ BlockHeight Storage::undoLatestBlock(bool notifySubs)
         auto & undo = *undoOpt; // non-const because we swap out its scripthashes potentially below if notifySubs == true
 
         // ensure undo info sanity
-        if (!undo.isValid() || undo.height != unsigned(tip) || undo.hash != BTC::HashRev(header)
+        if (!undo.isValid() || undo.height != unsigned(tip) || undo.hash != BTC::Hash2ByteArrayRev(header.GetHash())
             || prevHeight+1 >= p->blkInfos.size() || p->blkInfos.empty() || p->blkInfos.back() != undo.blkInfo)
             throw DatabaseFormatError(QString("The undo information for height %1 was successfully retrieved from the "
                                               "database, but it failed an internal consistency check.").arg(tip));
@@ -2899,7 +2898,7 @@ auto Storage::getHistory(const HashX & hashX, bool conf, bool unconf) const -> H
                 }
                 ret.reserve(total);
                 for (const auto & tx : txvec)
-                    ret.emplace_back(HistoryItem{tx->hash, tx->hasUnconfirmedParentTx ? -1 : 0, tx->fee});
+                    ret.emplace_back(HistoryItem{tx->txid, tx->hasUnconfirmedParentTx ? -1 : 0, tx->fee});
             }
         }
     } catch (const std::exception &e) {
@@ -2946,7 +2945,7 @@ auto Storage::listUnspent(const HashX & hashX) const -> UnspentItems
                                         LIKELY( ionum < tx->txos.size() && (it3 = tx->txos.cbegin() + ionum)->isValid() ))
                                 {
                                     ret.emplace_back(UnspentItem{
-                                        { tx->hash, 0 /* always put 0 for height here */, tx->fee }, // base HistoryItem
+                                        { tx->txid, 0 /* always put 0 for height here */, tx->fee }, // base HistoryItem
                                         ionum, // .tx_pos
                                         it3->amount,  // .value
                                         TxNum(1) + veryHighTxNum + TxNum(tx->hasUnconfirmedParentTx ? 1 : 0), // .txNum (this is fudged for sorting at the end properly)
@@ -2957,13 +2956,13 @@ auto Storage::listUnspent(const HashX & hashX) const -> UnspentItems
                                     }
                                 } else {
                                     // this should never happen!
-                                    Warning() << "Cannot find txo " << ionum << " for sh " << hashX.toHex() << " in tx " << tx->hash.toHex();
+                                    Warning() << "Cannot find txo " << ionum << " for sh " << hashX.toHex() << " in tx " << tx->txid.toHex();
                                     continue;
                                 }
                             }
                         } else {
                             // defensive programming. should never happen
-                            Warning() << "Cannot find scripthash " << hashX.toHex() << " in tx 'hashX -> IOInfo' map for tx " << tx->hash.toHex() << ". FIXME!";
+                            Warning() << "Cannot find scripthash " << hashX.toHex() << " in tx 'hashX -> IOInfo' map for tx " << tx->txid.toHex() << ". FIXME!";
                         }
                     }
                 }
@@ -3060,7 +3059,7 @@ auto Storage::getBalance(const HashX &hashX) const -> std::pair<bitcoin::Amount,
                     auto it2 = tx->hashXs.find(hashX);
                     if (UNLIKELY(it2 == tx->hashXs.end())) {
                         throw InternalError(QString("scripthash %1 lists tx %2, which then lacks the IOInfo for said hashX! FIXME!")
-                                            .arg(QString(hashX.toHex())).arg(QString(tx->hash.toHex())));
+                                            .arg(QString(hashX.toHex())).arg(QString(tx->txid.toHex())));
                     }
                     auto & info = it2->second;
                     for (const auto & [txo, txoinfo] : info.confirmedSpends)
@@ -3070,7 +3069,7 @@ auto Storage::getBalance(const HashX &hashX) const -> std::pair<bitcoin::Amount,
                                                                        || !(it3 = tx->txos.cbegin() + ionum)->isValid()) )
                         {
                             throw InternalError(QString("scripthash %1 lists tx %2, which then lacks a valid TXO IONum %3 for said hashX! FIXME!")
-                                                .arg(QString(hashX.toHex())).arg(QString(tx->hash.toHex())).arg(ionum));
+                                                .arg(QString(hashX.toHex())).arg(QString(tx->txid.toHex())).arg(ionum));
                         } else {
                             utxos += it3->amount;
                         }

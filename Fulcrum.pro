@@ -386,6 +386,7 @@ SOURCES += \
     bitcoin/feerate.cpp \
     bitcoin/hash.cpp \
     bitcoin/interpreter.cpp \
+    bitcoin/bitcoin_merkle.cpp \
     bitcoin/pubkey.cpp \
     bitcoin/script.cpp \
     bitcoin/script_error.cpp \
@@ -418,6 +419,7 @@ HEADERS += \
     bitcoin/feerate.h \
     bitcoin/hash.h \
     bitcoin/interpreter.h \
+    bitcoin/bitcoin_merkle.h \
     bitcoin/prevector.h \
     bitcoin/pubkey.h \
     bitcoin/reverse_iterator.h \
